@@ -1,241 +1,190 @@
-import cv2
+import datetime
+import os
+import threading
+import cv2 as cv
+# import pytesseract
+import easyocr
 import numpy as np
-from skimage.filters import threshold_local
-from skimage import measure
-import imutils
+import requests
 
-def sort_cont(character_contours):
-    """
-    To sort contours from left to right
-    """
-    i = 0
-    boundingBoxes = [cv2.boundingRect(c) for c in character_contours]
-    (character_contours, boundingBoxes) = zip(*sorted(zip(character_contours, boundingBoxes),
-                                                      key=lambda b: b[1][i], reverse=False))
-    return character_contours
+# pytesseract.pytesseract.tesseract_cmd = r'C:\Program Files (x86)\Tesseract-OCR\tesseract.exe'
+cascade = cv.CascadeClassifier("./haar/haarcascade_russian_plate_number.xml")
+
+##### todo : use numpy to store people that we got from the database
+##### people = np.array([]) then np.append(people,'user01')
+roomName = ""
+picturesDir = os.path.join(os.getcwd(), 'pictures')
+people = []
+studentIds = []
+is_entrance = True
+platesAlreadyRecognized = []
+platesRecognized = {}
+
+# api-endpoint
+URL = "http://localhost:8080/ws/cars/speak"
+reader = easyocr.Reader(['en', 'ar'])
 
 
-def segment_chars(plate_img, fixed_width):
-    """
-    extract Value channel from the HSV format of image and apply adaptive thresholding
-    to reveal the characters on the license plate
-    """
-    V = cv2.split(cv2.cvtColor(plate_img, cv2.COLOR_BGR2HSV))[2]
+# thread for sending video
+class my_thread(threading.Thread):
+    def __init__(self, thread_id, video):
+        threading.Thread.__init__(self)
+        self.threadID = thread_id
+        self.video = video
 
-    T = threshold_local(V, 29, offset=15, method='gaussian')
+    def run(self):
+        print("Starting " + str(self.threadID))
+        # Get lock to synchronize threads
+        threadLock.acquire()
+        send_email(self.video)
+        # Free lock to release next thread
+        threadLock.release()
 
-    thresh = (V > T).astype('uint8') * 255
 
-    thresh = cv2.bitwise_not(thresh)
+threadLock = threading.Lock()
 
-    # resize the license plate region to a canoncial size
-    plate_img = imutils.resize(plate_img, width=fixed_width)
-    thresh = imutils.resize(thresh, width=fixed_width)
-    bgr_thresh = cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
 
-    # perform a connected components analysis and initialize the mask to store the locations
-    # of the character candidates
-    labels = measure.label(thresh, neighbors=8, background=0)
+def send_email(videoFile):
+    print("Video sent.")
 
-    charCandidates = np.zeros(thresh.shape, dtype='uint8')
 
-    # loop over the unique components
-    characters = []
-    for label in np.unique(labels):
-        # if this is the background label, ignore it
-        if label == 0:
-            continue
-        # otherwise, construct the label mask to display only connected components for the
-        # current label, then find contours in the label mask
-        labelMask = np.zeros(thresh.shape, dtype='uint8')
-        labelMask[labels == label] = 255
+def face_rec():
+    threads = []
+    thread_number = 0
+    current_time = ''
 
-        cnts = cv2.findContours(labelMask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        cnts = cnts[0] if imutils.is_cv2() else cnts[1]
+    detection = False
+    time_detection_started = None
+    has_timer_started = False
+    SECONDS_TO_RECORD_AFTER_DETECTION = 35
+    PRECISION = 1500
 
-        # ensure at least one contour was found in the mask
-        if len(cnts) > 0:
+    # cap = cv.VideoCapture(0)
+    cap = cv.VideoCapture('testvideo/real3.mp4')
+    frame_size = (int(cap.get(3)), int(cap.get(4)))
+    fourcc = cv.VideoWriter_fourcc(*"mp4v")
+    # movment = cv.VideoWriter("movment.avi", fourcc, 5.0, (1280,720))
+    _, frame = cap.read()
+    _, frame2 = cap.read()
+    licensePlate = ""
 
-            # grab the largest contour which corresponds to the component in the mask, then
-            # grab the bounding box for the contour
-            c = max(cnts, key=cv2.contourArea)
-            (boxX, boxY, boxW, boxH) = cv2.boundingRect(c)
+    # try:
+    #     r = requests.get(url=URL + "/93719l")
+    # except:
+    #     print("error in request")
+    break_detect = False
+    while True:
+        diff = cv.absdiff(frame, frame2)
+        gray = cv.cvtColor(diff, cv.COLOR_BGR2GRAY)
+        blur = cv.GaussianBlur(gray, (5, 5), 0)
+        _, thresh = cv.threshold(blur, 20, 255, cv.THRESH_BINARY)
+        dilated = cv.dilate(thresh, None, iterations=3)
+        contours, _ = cv.findContours(dilated, cv.RETR_TREE, cv.CHAIN_APPROX_SIMPLE)
+        # print(contours)
+        for contour in contours:
+            (x, y, w, h) = cv.boundingRect(contour)
+            # print('contors')
+            if cv.contourArea(contour) > PRECISION:
+                if not detection:
+                    detection = True
+                    current_time = datetime.datetime.now().strftime("%d-%m-%Y-%H-%M-%S")
+                    # out = cv.VideoWriter(f"{current_time}.mp4", fourcc, 15, frame_size)
+                    print("Movement detected... Started Recording!")
 
-            # compute the aspect ratio, solodity, and height ration for the component
-            aspectRatio = boxW / float(boxH)
-            solidity = cv2.contourArea(c) / float(boxW * boxH)
-            heightRatio = boxH / float(plate_img.shape[0])
-
-            # determine if the aspect ratio, solidity, and height of the contour pass
-            # the rules tests
-            keepAspectRatio = aspectRatio < 1.0
-            keepSolidity = solidity > 0.15
-            keepHeight = heightRatio > 0.5 and heightRatio < 0.95
-
-            # check to see if the component passes all the tests
-            if keepAspectRatio and keepSolidity and keepHeight and boxW > 14:
-                # compute the convex hull of the contour and draw it on the character
-                # candidates mask
-                hull = cv2.convexHull(c)
-
-                cv2.drawContours(charCandidates, [hull], -1, 255, -1)
-
-    _, contours, hier = cv2.findContours(charCandidates, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-    if contours:
-        contours = sort_cont(contours)
-        addPixel = 4  # value to be added to each dimension of the character
-        for c in contours:
-            (x, y, w, h) = cv2.boundingRect(c)
-            if y > addPixel:
-                y = y - addPixel
+        if detection:
+            # out.write(frame)
+            if has_timer_started:
+                tempPlate = extract_plate(frame)
+                if len(tempPlate) > 0:
+                    licensePlate = tempPlate
+                    break_detect = True
+                print(time_detection_ends - datetime.datetime.now())
+                if datetime.datetime.now() >= time_detection_ends or len(tempPlate) > 0:
+                    detection = False
+                    has_timer_started = False
+                    licensePlate = tempPlate
+                    # out.release()
+                    # thread_number += 1
+                    # print('Stop Recording! sending Plate Number ....!')
+                    # # Create new threads
+                    # thread = my_thread(thread_number, f"{current_time}.mp4")
+                    # # Start new Threads
+                    # thread.start()
+                    # # Add threads to thread list
+                    # threads.append(thread)
+                    # # Wait for all threads to complete
+                    # print("Exiting Main Thread")
+                    # print('Stop Recording!')
+                    # sending get request and saving the response as response object
+                    try:
+                        # print("sending request :" + licensePlate + " --- " + len(licensePlate))
+                        if len(licensePlate) > 0:
+                            r = requests.get(url=URL + "/" + licensePlate)
+                            # extracting data in json format
+                            # data = r.json()
+                            # print(r)
+                    except:
+                        print("error in request")
             else:
-                y = 0
-            if x > addPixel:
-                x = x - addPixel
-            else:
-                x = 0
-            temp = bgr_thresh[y:y + h + (addPixel * 2), x:x + w + (addPixel * 2)]
+                # print('now im not 2')
+                break_detect = False
+                has_timer_started = True
+                time_detection_ends = datetime.datetime.now() + datetime.timedelta(
+                    seconds=SECONDS_TO_RECORD_AFTER_DETECTION)
+                # time_detection_started = time.time()
 
-            characters.append(temp)
-        return characters
-    else:
-        return None
+        frame = frame2
+        _, frame2 = cap.read()
+        # cv.imshow("Camera", frame)
+        # print(facesRecognized)
+        # if cv.waitKey(1) == ord('q'):
+        #     break
+
+    # out.release()
+    cap.release()
+    cv.destroyAllWindows()
 
 
-class PlateFinder:
-    def __init__(self):
-        self.min_area = 4500  # minimum area of the plate
-        self.max_area = 30000  # maximum area of the plate
+def extract_plate(img):
+    global read
+    # img = cv.imread(image_name)
+    grey = cv.cvtColor(img, cv.COLOR_BGR2GRAY)
+    nplate = cascade.detectMultiScale(grey, 1.2, 3)
+    licensePlate = ""
+    for (x, y, w, h) in nplate:
+        # a, b = (int(0.02 * img.shape[0]), int(0.025 * img.shape[1]))
+        # plate = img[y - 5 + a:(y + 5) + h - a, x - 5 + b:(x + 5) + w - b,:]
+        plate = img[y:y + h, x:x + w, :]
+        plate = cv.cvtColor(plate, cv.COLOR_BGR2GRAY)
+        _, plate = cv.threshold(plate, 65, 255, cv.THRESH_BINARY_INV)
+        ##cv.imshow("plate", plate)
+        # plate = img[y:y + h, x:x + w]
+        # kernel = np.ones((1, 1), np.uint8)
+        # plate = cv.dilate(plate, kernel, iterations=1)
+        # plate = cv.erode(plate, kernel, iterations=1)
+        # plate_grey = cv.cvtColor(plate, cv.COLOR_BGR2GRAY)
+        # (thresh, plate) = cv.threshold(plate_grey, 127, 255, cv.THRESH_BINARY)
+        # while True:qqq
+        #     cv.imshow("plate", plate)
+        #     if cv.waitKey(1) == ord('q'):
+        #         break
+        ############"""
+        # text = pytesseract.image_to_string(plate, lang='eng', config='--psm 6')
+        # text = ''.join(e for e in text if e.isalnum())
+        text = reader.readtext(plate)
+        for txt in text:
+            text_bx, plat_num, score = txt
+            if score>0.5:
+                if plat_num not in platesAlreadyRecognized:
+                    platesRecognized.update({plat_num: platesRecognized.setdefault(plat_num, 0) + 1})
+                for key, val in list(platesRecognized.items()):
+                    if val >= 10:
+                        platesAlreadyRecognized.append(key)
+                        licensePlate = plat_num
+                        #del platesRecognized[key]
+                        platesRecognized.clear()
+                        print(str(plat_num) + "////" + str(score))
+    return licensePlate
 
-        self.element_structure = cv2.getStructuringElement(shape=cv2.MORPH_RECT, ksize=(22, 3))
 
-    def preprocess(self, input_img):
-        imgBlurred = cv2.GaussianBlur(input_img, (7, 7), 0)  # old window was (5,5)
-        gray = cv2.cvtColor(imgBlurred, cv2.COLOR_BGR2GRAY)  # convert to gray
-        sobelx = cv2.Sobel(gray, cv2.CV_8U, 1, 0, ksize=3)  # sobelX to get the vertical edges
-        ret2, threshold_img = cv2.threshold(sobelx, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
-
-        element = self.element_structure
-        morph_n_thresholded_img = threshold_img.copy()
-        cv2.morphologyEx(src=threshold_img, op=cv2.MORPH_CLOSE, kernel=element, dst=morph_n_thresholded_img)
-        return morph_n_thresholded_img
-
-    def extract_contours(self, after_preprocess):
-        _, contours = cv2.findContours(after_preprocess, mode=cv2.RETR_EXTERNAL,
-                                          method=cv2.CHAIN_APPROX_NONE)
-        return contours
-
-    def clean_plate(self, plate):
-        gray = cv2.cvtColor(plate, cv2.COLOR_BGR2GRAY)
-        thresh = cv2.adaptiveThreshold(gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 11, 2)
-        _, contours, _ = cv2.findContours(thresh.copy(), cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_NONE)
-
-        if contours:
-            areas = [cv2.contourArea(c) for c in contours]
-            max_index = np.argmax(areas)  # index of the largest contour in the area array
-
-            max_cnt = contours[max_index]
-            max_cntArea = areas[max_index]
-            x, y, w, h = cv2.boundingRect(max_cnt)
-            rect = cv2.minAreaRect(max_cnt)
-            rotatedPlate = plate
-            if not self.ratioCheck(max_cntArea, rotatedPlate.shape[1], rotatedPlate.shape[0]):
-                return plate, False, None
-            return rotatedPlate, True, [x, y, w, h]
-        else:
-            return plate, False, None
-
-    def check_plate(self, input_img, contour):
-        min_rect = cv2.minAreaRect(contour)
-        if self.validateRatio(min_rect):
-            x, y, w, h = cv2.boundingRect(contour)
-            after_validation_img = input_img[y:y + h, x:x + w]
-            after_clean_plate_img, plateFound, coordinates = self.clean_plate(after_validation_img)
-            if plateFound:
-                characters_on_plate = self.find_characters_on_plate(after_clean_plate_img)
-                if (characters_on_plate is not None and len(characters_on_plate) == 8):
-                    x1, y1, w1, h1 = coordinates
-                    coordinates = x1 + x, y1 + y
-                    after_check_plate_img = after_clean_plate_img
-                    return after_check_plate_img, characters_on_plate, coordinates
-        return None, None, None
-
-    def find_possible_plates(self, input_img):
-        """
-        Finding all possible contours that can be plates
-        """
-        plates = []
-        self.char_on_plate = []
-        self.corresponding_area = []
-
-        self.after_preprocess = self.preprocess(input_img)
-        possible_plate_contours = self.extract_contours(self.after_preprocess)
-
-        for cnts in possible_plate_contours:
-            plate, characters_on_plate, coordinates = self.check_plate(input_img, cnts)
-            if plate is not None:
-                plates.append(plate)
-                self.char_on_plate.append(characters_on_plate)
-                self.corresponding_area.append(coordinates)
-
-        if (len(plates) > 0):
-            return plates
-        else:
-            return None
-
-    def find_characters_on_plate(self, plate):
-
-        charactersFound = segment_chars(plate, 400)
-        if charactersFound:
-            return charactersFound
-
-    # PLATE FEATURES
-    def ratioCheck(self, area, width, height):
-        min = self.min_area
-        max = self.max_area
-
-        ratioMin = 3
-        ratioMax = 6
-
-        ratio = float(width) / float(height)
-        if ratio < 1:
-            ratio = 1 / ratio
-
-        if (area < min or area > max) or (ratio < ratioMin or ratio > ratioMax):
-            return False
-        return True
-
-    def preRatioCheck(self, area, width, height):
-        min = self.min_area
-        max = self.max_area
-
-        ratioMin = 2.5
-        ratioMax = 7
-
-        ratio = float(width) / float(height)
-        if ratio < 1:
-            ratio = 1 / ratio
-
-        if (area < min or area > max) or (ratio < ratioMin or ratio > ratioMax):
-            return False
-        return True
-
-    def validateRatio(self, rect):
-        (x, y), (width, height), rect_angle = rect
-
-        if (width > height):
-            angle = -rect_angle
-        else:
-            angle = 90 + rect_angle
-
-        if angle > 15:
-            return False
-        if (height == 0 or width == 0):
-            return False
-
-        area = width * height
-        if not self.preRatioCheck(area, width, height):
-            return False
-        else:
-            return True
-
+face_rec()
